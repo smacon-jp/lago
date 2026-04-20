@@ -1,0 +1,29 @@
+# Custom lago-front image that bakes the fixed nginx config directly into the
+# image, eliminating the bind-mount that Dokploy would otherwise overwrite on
+# each redeploy.
+#
+# Changes vs stock getlago/front:
+#   - resolver 127.0.0.11 valid=10s  -> prevents stale-IP 502 after api recreate
+#   - set $lago_api_upstream + proxy_pass with variable -> forces DNS re-resolution
+#   - unique upstream name "lago-api" avoids DNS collision with other dokploy
+#     projects that also expose a service named "api" on dokploy-network
+#
+# Build:
+#   docker build \
+#     --build-arg LAGO_VERSION=v1.45.1 \
+#     -f Dockerfile.front-premium \
+#     -t lago-front-premium:v1.45.1 \
+#     .
+
+ARG LAGO_VERSION=v1.45.1
+FROM getlago/front:${LAGO_VERSION}
+
+COPY docker/nginx-lago.conf /etc/nginx/conf.d/default.conf
+
+# Validate config at build time — fails build if nginx syntax broken
+RUN nginx -t
+
+LABEL org.opencontainers.image.source="https://github.com/smacon-jp/lago"
+LABEL org.opencontainers.image.description="Lago Front with fixed nginx resolver (AGPL self-hosted)"
+LABEL com.smacon.lago.base="getlago/front:${LAGO_VERSION}"
+LABEL com.smacon.lago.patch="nginx-resolver-v1"

@@ -2,44 +2,84 @@
 
 # Premium feature unlock for self-hosted Lago (AGPL fork).
 #
-# Overrides the two license gates in lago-api so all premium features are
-# enabled without a Lago Cloud license key:
+# Removes both license gate layers:
 #
-#   1. LagoUtils::License#premium?  - global "is this a paid cloud tenant?" flag
-#   2. Organization#<integration>_enabled?  - per-org premium integration toggles
+#   Layer 1 — LagoUtils::License#premium?
+#     Global flag that gates most premium features. Forced to true.
 #
-# This file is copied into /app/config/initializers/ at image build time by
-# Dockerfile.api-premium. It runs after Rails eager-loads all app classes, so
-# both the License singleton (see config/initializers/license.rb) and the
-# Organization model already exist when this executes.
+#   Layer 2 — Organization#<integration>_enabled?
+#     Per-org instance methods that combine License.premium? with a DB
+#     column check (premium_integrations varchar[]). Both parts are addressed:
+#       a) Each method forced to return true (instance-level API)
+#       b) The DB column is backfilled and kept populated (SQL-scope API)
+#
+# Why the DB column also matters:
+#   Organization model defines scopes like:
+#     scope :with_netsuite_support, -> { where("? = ANY(premium_integrations)", "netsuite") }
+#   Background jobs and analytics queries use these scopes directly against
+#   the database — they bypass the instance method override. Without backfill,
+#   those jobs silently skip every org even though the UI shows features active.
 #
 # Upstream-update robustness:
-#   - Uses class_eval + define_method against named constants
-#     (LagoUtils::License, Organization, Organization::PREMIUM_INTEGRATIONS)
-#   - Fails loudly if any of those constants go missing on a future upstream
-#     bump, so the image build or boot errors instead of silently reverting to
-#     the locked behavior.
+#   Raises at boot if LagoUtils::License, Organization, or
+#   Organization::PREMIUM_INTEGRATIONS are missing, giving a loud signal on
+#   version bumps instead of silently reverting to locked behavior.
+
+ALL_INTEGRATIONS_SQL = Organization::PREMIUM_INTEGRATIONS.map { |i| "'#{i}'" }.join(",") if defined?(Organization::PREMIUM_INTEGRATIONS)
 
 Rails.application.config.after_initialize do
-  raise "Premium unlock: LagoUtils::License missing" unless defined?(LagoUtils::License)
-  raise "Premium unlock: Organization model missing" unless defined?(Organization)
-  raise "Premium unlock: Organization::PREMIUM_INTEGRATIONS missing" unless defined?(Organization::PREMIUM_INTEGRATIONS)
+  # --- safety guards --------------------------------------------------------
+  raise "[premium-unlock] LagoUtils::License missing" unless defined?(LagoUtils::License)
+  raise "[premium-unlock] Organization model missing" unless defined?(Organization)
+  raise "[premium-unlock] Organization::PREMIUM_INTEGRATIONS missing" unless defined?(Organization::PREMIUM_INTEGRATIONS)
 
-  # Layer 1: global license always premium.
+  all_integrations = Organization::PREMIUM_INTEGRATIONS
+  integrations_sql  = all_integrations.map { |i| "'#{i}'" }.join(",")
+
+  # --- Layer 1: global license always premium --------------------------------
   LagoUtils::License.class_eval do
     define_method(:premium?) { true }
     define_method(:verify)   { @premium = true }
   end
 
-  # Layer 2: every per-org <integration>_enabled? returns true.
+  # --- Layer 2a: instance method override ------------------------------------
   Organization.class_eval do
-    Organization::PREMIUM_INTEGRATIONS.each do |premium_integration|
-      define_method("#{premium_integration}_enabled?") { true }
+    all_integrations.each do |pi|
+      define_method("#{pi}_enabled?") { true }
     end
   end
 
+  # --- Layer 2b: DB column backfill (makes SQL scopes work) ------------------
+  # Runs in a background thread so a slow DB on boot doesn't block puma/sidekiq.
+  # Retries with back-off in case the DB isn't fully ready yet.
+  Thread.new do
+    retries = 0
+    begin
+      sql = <<~SQL
+        UPDATE organizations
+        SET    premium_integrations = ARRAY[#{integrations_sql}]::varchar[]
+        WHERE  NOT (premium_integrations @> ARRAY[#{integrations_sql}]::varchar[])
+      SQL
+      rows = ApplicationRecord.connection.execute(sql).cmd_tuples
+      Rails.logger.info "[premium-unlock] DB backfill: #{rows} org(s) updated"
+    rescue => e
+      if retries < 5
+        retries += 1
+        sleep(retries * 2)
+        retry
+      end
+      Rails.logger.error "[premium-unlock] DB backfill failed after #{retries} retries: #{e.message}"
+    end
+  end
+
+  # --- Layer 2c: auto-populate premium_integrations for newly created orgs ---
+  Organization.after_create_commit do
+    update_columns(premium_integrations: Organization::PREMIUM_INTEGRATIONS)
+  end
+
   Rails.logger.info(
-    "[premium-unlock] all #{Organization::PREMIUM_INTEGRATIONS.size} premium integrations + " \
-    "License.premium? forced true"
+    "[premium-unlock] License.premium? forced true | " \
+    "#{all_integrations.size} integration methods overridden | " \
+    "DB backfill running in background"
   )
 end
