@@ -1,0 +1,32 @@
+# Custom lago-api image that overlays a Rails initializer to unlock all
+# premium features in the self-hosted AGPL build. No upstream source edits —
+# the initializer monkey-patches License and Organization at boot.
+#
+# Build:
+#   docker build \
+#     --build-arg LAGO_VERSION=v1.45.1 \
+#     -f Dockerfile.api-premium \
+#     -t lago-api-premium:v1.45.1 \
+#     .
+#
+# Future upstream bump:
+#   docker build --build-arg LAGO_VERSION=vX.Y.Z -f Dockerfile.api-premium \
+#     -t lago-api-premium:vX.Y.Z .
+#
+# The build will fail fast if LagoUtils::License or Organization::PREMIUM_INTEGRATIONS
+# are removed/renamed upstream, so you get a loud signal instead of silent lock-back.
+
+ARG LAGO_VERSION=v1.45.1
+FROM getlago/api:${LAGO_VERSION}
+
+# Initializer file name prefixed 999_ so it runs after every upstream
+# initializer, including the one that assigns the License singleton.
+COPY docker/unlock_premium.rb /app/config/initializers/999_unlock_premium.rb
+
+# Ruby syntax check on the injected file — fail build if initializer malformed.
+RUN ruby -c /app/config/initializers/999_unlock_premium.rb
+
+LABEL org.opencontainers.image.source="https://github.com/smacon-jp/lago"
+LABEL org.opencontainers.image.description="Lago API with premium features unlocked (AGPL self-hosted)"
+LABEL com.smacon.lago.base="getlago/api:${LAGO_VERSION}"
+LABEL com.smacon.lago.patch="premium-unlock-v1"
